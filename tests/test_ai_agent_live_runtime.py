@@ -46,6 +46,18 @@ def test_validate_macro_args_rejects_invalid_payload(
     assert error.startswith(expected_error_prefix)
 
 
+def test_validate_macro_args_accepts_alias_and_ignores_unknown_when_valid_present() -> None:
+    agent = AIAgent(live_enabled=False)
+    parsed, error = agent._validate_macro_args(  # noqa: SLF001 - internal behavior contract
+        MACRO_FUNCTION_NAME,
+        {"filter": 0.3, "pitch": 0.9, "volume": 0.1},
+    )
+
+    assert error is None
+    assert parsed == {"filter_macro": 0.3}
+    assert agent._latest_macro_controls["filter_macro"] == pytest.approx(0.3)  # noqa: SLF001
+
+
 def test_controls_for_time_hold_and_ramp() -> None:
     agent = AIAgent(live_enabled=False, hold_sec=2.0, neutral_ramp_sec=1.0)
     agent._latest_macro_controls = {"filter_macro": 1.0, "eq_low_macro": -0.5}  # noqa: SLF001
@@ -85,3 +97,60 @@ def test_infer_is_non_blocking_and_enqueues_prompt_context() -> None:
 
     asyncio.run(_run())
 
+
+def test_flush_text_queue_uses_client_content_path() -> None:
+    agent = AIAgent(live_enabled=False)
+    agent._enqueue_text("user_prompt: 드랍 터뜨려줘")  # noqa: SLF001
+    agent._enqueue_text('runtime_context: {"vision_ts": 1.23}')  # noqa: SLF001
+
+    class _FakePart:
+        def __init__(self, text: str | None = None) -> None:
+            self.text = text
+
+    class _FakeContent:
+        def __init__(self, role: str, parts: list[_FakePart]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeTypes:
+        Content = _FakeContent
+        Part = _FakePart
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        async def send_client_content(self, *, turns: _FakeContent, turn_complete: bool) -> None:
+            text = turns.parts[0].text if turns.parts else ""
+            self.calls.append((text or "", turn_complete))
+
+    async def _run() -> None:
+        session = _FakeSession()
+        await agent._flush_text_queue(session=session, types_mod=_FakeTypes)  # noqa: SLF001
+        assert session.calls == [
+            ("드랍 터뜨려줘", True),
+            ('{"vision_ts": 1.23}', False),
+        ]
+
+    asyncio.run(_run())
+
+
+def test_validate_macro_args_accepts_mapping_from_partial_completion_path() -> None:
+    agent = AIAgent(live_enabled=False)
+    agent._pending_partial_args["call-1"] = '{"filter_macro": 0.4, "reverb_macro": -0.2'  # noqa: SLF001
+
+    partial_tail = "}"
+    parsed = None
+    text = agent._pending_partial_args.pop("call-1", "") + partial_tail  # noqa: SLF001
+    loaded = None
+    try:
+        loaded = __import__("json").loads(text)
+    except Exception:
+        loaded = None
+    if isinstance(loaded, dict):
+        parsed = loaded
+
+    accepted, error = agent._validate_macro_args(MACRO_FUNCTION_NAME, parsed)  # noqa: SLF001
+    assert error is None
+    assert accepted["filter_macro"] == pytest.approx(0.4)
+    assert accepted["reverb_macro"] == pytest.approx(-0.2)

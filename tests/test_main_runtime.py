@@ -107,6 +107,10 @@ def test_run_dry_run_starts_and_stops_ai_agent(monkeypatch: pytest.MonkeyPatch) 
         def __init__(self, **_: object) -> None:
             self.started = 0
             self.stopped = 0
+            self.last_server_text = ""
+            self.connection_state = "disabled"
+            self.session_handle = None
+            self.last_error = None
             self.__class__.instances.append(self)
 
         async def start(self) -> None:

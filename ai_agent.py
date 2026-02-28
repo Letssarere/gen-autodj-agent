@@ -17,6 +17,26 @@ MACRO_TARGETS = (
 )
 MACRO_TARGET_SET = frozenset(MACRO_TARGETS)
 MACRO_FUNCTION_NAME = "set_macro_controls"
+MACRO_FIELD_ALIASES = {
+    # filter family
+    "filter": "filter_macro",
+    "filter_cutoff": "filter_macro",
+    # beat-repeat family
+    "beat_repeat": "beat_repeat_macro",
+    "beatrepeat": "beat_repeat_macro",
+    "repeat": "beat_repeat_macro",
+    "stutter": "beat_repeat_macro",
+    "glitch": "beat_repeat_macro",
+    "delay": "beat_repeat_macro",
+    # reverb family
+    "reverb": "reverb_macro",
+    "room": "reverb_macro",
+    # EQ low family
+    "eq_low": "eq_low_macro",
+    "low_eq": "eq_low_macro",
+    "bass": "eq_low_macro",
+    "low": "eq_low_macro",
+}
 
 
 @dataclass
@@ -68,9 +88,11 @@ class AIAgent:
         self._session_handle: str | None = None
         self._connection_state = "idle"
         self._last_server_text = ""
+        self._last_error: str | None = None
 
         self._last_prompt_sent: str | None = None
         self._last_context_push_monotonic = 0.0
+        self._pending_partial_args: dict[str, str] = {}
 
     @property
     def session_handle(self) -> str | None:
@@ -79,6 +101,14 @@ class AIAgent:
     @property
     def connection_state(self) -> str:
         return self._connection_state
+
+    @property
+    def last_server_text(self) -> str:
+        return self._last_server_text
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
 
     async def start(self) -> None:
         if not self._live_enabled:
@@ -95,6 +125,7 @@ class AIAgent:
 
         self._stop_event = asyncio.Event()
         self._connection_state = "starting"
+        self._last_error = None
         self._supervisor_task = asyncio.create_task(
             self._run_supervisor(),
             name="ai_agent_live_supervisor",
@@ -146,6 +177,7 @@ class AIAgent:
                 raise
             except Exception as exc:
                 self._connection_state = f"error:{exc.__class__.__name__}"
+                self._last_error = str(exc)
                 await asyncio.sleep(backoff_sec)
                 backoff_sec = min(5.0, backoff_sec * 2.0)
             else:
@@ -167,6 +199,37 @@ class AIAgent:
 
         async with client.aio.live.connect(model=self._model, config=config) as session:
             self._connection_state = "connected"
+            self._last_error = None
+            self._pending_partial_args.clear()
+
+            # Prime tool-use behavior early to reduce natural-language drift.
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=(
+                                "Operate autonomously from live audio/video input. "
+                                "Prioritize tool use over natural language. "
+                                "Call set_macro_controls repeatedly (roughly every 1-2 seconds) "
+                                "with meaningful parameter updates in [-1, 1]. "
+                                "Only valid keys are: filter_macro, beat_repeat_macro, reverb_macro, eq_low_macro. "
+                                "Do not use keys like filter, volume, pitch, tempo, eq_high, eq_mid, crossfade. "
+                                "Interpret body language strongly: repeated fist pumping, rapid arm pushes, large up/down movement, "
+                                "high facial excitement, and strong vocal energy mean build-up/high energy. "
+                                "For high energy: push filter_macro up (0.5~1.0), reverb_macro up (0.2~0.8), "
+                                "and pulse beat_repeat_macro (0.1~0.7) briefly. "
+                                "Interpret pre-drop tension cues (focused face, preparing posture, reduced movement, anticipation) "
+                                "as controlled build: keep filter high, reverb moderate, beat repeat restrained. "
+                                "Interpret calm/down energy (small movement, relaxed posture, low vocal intensity) "
+                                "as low intensity: reduce effects and move toward neutral. "
+                                "Do not output long explanations; prefer tool calls."
+                            )
+                        )
+                    ],
+                ),
+                turn_complete=True,
+            )
 
             tasks = [
                 asyncio.create_task(
@@ -229,9 +292,10 @@ class AIAgent:
 
         tool = types_mod.Tool(function_declarations=[function_decl])
 
-        session_resumption = types_mod.SessionResumptionConfig(
-            handle=self._session_handle,
-            transparent=True,
+        session_resumption = (
+            types_mod.SessionResumptionConfig(handle=self._session_handle)
+            if self._session_handle
+            else None
         )
         compression = types_mod.ContextWindowCompressionConfig(
             trigger_tokens=24000,
@@ -241,15 +305,30 @@ class AIAgent:
         system_instruction = (
             "You are an AI DJ macro controller. "
             "Prioritize tool call 'set_macro_controls' over natural language. "
-            "Only emit values in [-1.0, 1.0]."
+            "Only emit values in [-1.0, 1.0]. "
+            "Do not narrate internal reasoning when tool call is applicable. "
+            "Valid argument keys are strictly: filter_macro, beat_repeat_macro, reverb_macro, eq_low_macro. "
+            "Do not stay static at neutral unless the live scene is truly static. "
+            "Map energetic gestures (fist pumps, push-up motions, fast movement) to stronger macro changes. "
+            "Map calm pre-drop anticipation to controlled tension, not random spikes."
         )
 
+        # Native-audio preview models are configured with AUDIO response modality.
+        # We keep text observability via output_audio_transcription.
+        if "native-audio" in self._model:
+            response_modalities = ["AUDIO"]
+            output_audio_transcription = types_mod.AudioTranscriptionConfig()
+        else:
+            response_modalities = ["TEXT"]
+            output_audio_transcription = None
+
         return types_mod.LiveConnectConfig(
-            response_modalities=["TEXT"],
+            response_modalities=response_modalities,
             system_instruction=system_instruction,
             tools=[tool],
             session_resumption=session_resumption,
             context_window_compression=compression,
+            output_audio_transcription=output_audio_transcription,
         )
 
     async def _listen_audio(self, *, audio_queue: asyncio.Queue[bytes], session_stop: asyncio.Event) -> None:
@@ -261,23 +340,27 @@ class AIAgent:
                 "Install portaudio and pyaudio (brew install portaudio && pip install pyaudio)."
             ) from exc
 
+        loop = asyncio.get_running_loop()
         audio = pyaudio.PyAudio()
+
+        def _on_audio(in_data: bytes, frame_count: int, time_info: Any, status_flags: int) -> tuple[None, int]:
+            _ = frame_count, time_info, status_flags
+            loop.call_soon_threadsafe(self._queue_put_latest, audio_queue, in_data)
+            return (None, pyaudio.paContinue)
+
         stream = audio.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=self._audio_rate_hz,
             input=True,
             frames_per_buffer=self._audio_frames_per_chunk,
+            stream_callback=_on_audio,
         )
 
         try:
+            stream.start_stream()
             while not self._stop_event.is_set() and not session_stop.is_set():
-                chunk = await asyncio.to_thread(
-                    stream.read,
-                    self._audio_frames_per_chunk,
-                    exception_on_overflow=False,
-                )
-                self._queue_put_latest(audio_queue, chunk)
+                await asyncio.sleep(0.05)
         finally:
             with contextlib.suppress(Exception):
                 stream.stop_stream()
@@ -307,7 +390,7 @@ class AIAgent:
                 if wait_sec > 0:
                     await asyncio.sleep(wait_sec)
 
-                ok, frame = await asyncio.to_thread(capture.read)
+                ok, frame = capture.read()
                 if not ok:
                     await asyncio.sleep(0.05)
                     continue
@@ -332,7 +415,7 @@ class AIAgent:
         session_stop: asyncio.Event,
     ) -> None:
         while not self._stop_event.is_set() and not session_stop.is_set():
-            await self._flush_text_queue(session=session)
+            await self._flush_text_queue(session=session, types_mod=types_mod)
 
             audio_chunk: bytes | None = None
             video_frame: bytes | None = None
@@ -348,27 +431,44 @@ class AIAgent:
                 await asyncio.sleep(0.01)
                 continue
 
-            kwargs: dict[str, Any] = {}
             if audio_chunk is not None:
-                kwargs["audio"] = types_mod.Blob(
-                    data=audio_chunk,
-                    mime_type=f"audio/pcm;rate={self._audio_rate_hz}",
+                await session.send_realtime_input(
+                    audio=types_mod.Blob(
+                        data=audio_chunk,
+                        mime_type=f"audio/pcm;rate={self._audio_rate_hz}",
+                    )
                 )
             if video_frame is not None:
-                kwargs["video"] = types_mod.Blob(
-                    data=video_frame,
-                    mime_type="image/jpeg",
+                await session.send_realtime_input(
+                    video=types_mod.Blob(
+                        data=video_frame,
+                        mime_type="image/jpeg",
+                    )
                 )
 
-            await session.send_realtime_input(**kwargs)
-
-    async def _flush_text_queue(self, *, session: Any) -> None:
+    async def _flush_text_queue(self, *, session: Any, types_mod: Any) -> None:
         while True:
             try:
                 text = self._text_queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            await session.send_realtime_input(text=text)
+            turn_complete = True
+            body = text
+
+            if text.startswith("runtime_context:"):
+                turn_complete = False
+                body = text[len("runtime_context:") :].strip()
+            elif text.startswith("user_prompt:"):
+                turn_complete = True
+                body = text[len("user_prompt:") :].strip()
+
+            await session.send_client_content(
+                turns=types_mod.Content(
+                    role="user",
+                    parts=[types_mod.Part(text=body)],
+                ),
+                turn_complete=turn_complete,
+            )
 
     async def _receive_from_gemini(self, *, session: Any, types_mod: Any, session_stop: asyncio.Event) -> None:
         async for message in session.receive():
@@ -389,6 +489,13 @@ class AIAgent:
                         text_parts.append(part.text)
                 if text_parts:
                     self._last_server_text = "".join(text_parts)
+                    self._last_error = None
+
+            if message.server_content and message.server_content.output_transcription:
+                text = getattr(message.server_content.output_transcription, "text", None)
+                if text:
+                    self._last_server_text = text
+                    self._last_error = None
 
             tool_call = message.tool_call
             if tool_call is None or not tool_call.function_calls:
@@ -396,11 +503,33 @@ class AIAgent:
 
             function_responses = []
             for call in tool_call.function_calls:
-                accepted, error = self._validate_macro_args(call.name, call.args)
+                call_id = call.id or ""
+
+                # Live may stream function arguments incrementally.
+                if call.will_continue:
+                    if isinstance(call.partial_args, str):
+                        self._pending_partial_args[call_id] = self._pending_partial_args.get(call_id, "") + call.partial_args
+                    continue
+
+                parsed_args: Mapping[str, Any] | None = call.args if isinstance(call.args, Mapping) else None
+                if parsed_args is None:
+                    partial_text = self._pending_partial_args.pop(call_id, "")
+                    if isinstance(call.partial_args, str):
+                        partial_text += call.partial_args
+                    if partial_text:
+                        try:
+                            loaded = json.loads(partial_text)
+                        except json.JSONDecodeError:
+                            loaded = None
+                        if isinstance(loaded, Mapping):
+                            parsed_args = loaded
+
+                accepted, error = self._validate_macro_args(call.name, parsed_args)
                 if error is None:
                     payload = {"status": "ok", "accepted": accepted}
                 else:
                     payload = {"status": "error", "error": error}
+                    self._last_error = payload["error"]
                 function_responses.append(
                     types_mod.FunctionResponse(
                         id=call.id,
@@ -409,7 +538,8 @@ class AIAgent:
                     )
                 )
 
-            await session.send_tool_response(function_responses=function_responses)
+            if function_responses:
+                await session.send_tool_response(function_responses=function_responses)
 
     def _validate_macro_args(self, function_name: str | None, args: Mapping[str, Any] | None) -> tuple[dict[str, float], str | None]:
         if function_name != MACRO_FUNCTION_NAME:
@@ -421,21 +551,26 @@ class AIAgent:
         if not args:
             return {}, "invalid_args:empty_payload"
 
-        unknown = set(args.keys()) - MACRO_TARGET_SET
-        if unknown:
-            unknown_csv = ",".join(sorted(unknown))
-            return {}, f"invalid_args:unknown_fields:{unknown_csv}"
-
         parsed: dict[str, float] = {}
+        unknown_fields: list[str] = []
         for key, raw in args.items():
+            canonical = MACRO_FIELD_ALIASES.get(key, key)
+            if canonical not in MACRO_TARGET_SET:
+                unknown_fields.append(key)
+                continue
+
             try:
                 value = float(raw)
             except (TypeError, ValueError):
-                return {}, f"invalid_args:not_number:{key}"
+                return {}, f"invalid_args:not_number:{canonical}"
 
             if value < -1.0 or value > 1.0:
-                return {}, f"invalid_args:out_of_range:{key}"
-            parsed[key] = value
+                return {}, f"invalid_args:out_of_range:{canonical}"
+            parsed[canonical] = value
+
+        if not parsed:
+            unknown_csv = ",".join(sorted(unknown_fields))
+            return {}, f"invalid_args:unknown_fields:{unknown_csv}"
 
         self._latest_macro_controls.update(parsed)
         self._last_tool_call_monotonic = time.monotonic()

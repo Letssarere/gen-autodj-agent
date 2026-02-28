@@ -77,6 +77,8 @@ async def run(
 
     await ai_agent.start()
     last_dry_run: dict[str, float] = {}
+    last_live_applied: dict[str, float] = {}
+    last_heartbeat = 0.0
 
     try:
         while True:
@@ -92,6 +94,25 @@ async def run(
                         last_dry_run = dict(normalized)
                 else:
                     controller.set_batch_normalized(normalized, smoothing_ms=250)
+                    if gemini_live and normalized != last_live_applied:
+                        print(f"[live] applied controls: {normalized}")
+                        last_live_applied = dict(normalized)
+
+            if dry_run_controls or gemini_live:
+                now = asyncio.get_running_loop().time()
+                if now - last_heartbeat >= 2.0:
+                    snippet = ai_agent.last_server_text.strip().replace("\n", " ")
+                    if len(snippet) > 80:
+                        snippet = f"{snippet[:77]}..."
+                    prefix = "[dry-run]" if dry_run_controls else "[live]"
+                    print(
+                        f"{prefix} "
+                        f"live_state={ai_agent.connection_state} "
+                        f"handle={ai_agent.session_handle or '-'} "
+                        f"last_text={snippet or '-'} "
+                        f"last_error={ai_agent.last_error or '-'}"
+                    )
+                    last_heartbeat = now
 
             await asyncio.sleep(control_interval_sec)
     finally:
