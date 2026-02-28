@@ -1,0 +1,38 @@
+[
+  {
+    "name": "filter_macro",
+    "track_index": 0,
+    "device_index": 0,
+    "parameter_index": 1,
+    "min_value": 0.0,
+    "max_value": 127.0,
+    "invert": false
+  },
+  {
+    "name": "beat_repeat_macro",
+    "track_index": 0,
+    "device_index": 0,
+    "parameter_index": 2,
+    "min_value": 0.0,
+    "max_value": 127.0,
+    "invert": false
+  },
+  {
+    "name": "reverb_macro",
+    "track_index": 0,
+    "device_index": 0,
+    "parameter_index": 3,
+    "min_value": 0.0,
+    "max_value": 127.0,
+    "invert": false
+  },
+  {
+    "name": "eq_low_macro",
+    "track_index": 0,
+    "device_index": 0,
+    "parameter_index": 4,
+    "min_value": 0.0,
+    "max_value": 127.0,
+    "invert": false
+  }
+]

@@ -1,42 +1,75 @@
-# 🤖 AGENTS.md (System Architecture & Integration Guide)
+# 🤖 AGENTS.md (Architecture Constitution)
 
 ## 1. Project Vision: "Invisible DJ"
-본 프로젝트는 별도의 외부 장비 없이 **MacBook 내장 하드웨어**만을 활용하여 사용자의 동작(Vision)과 음성/음악 맥락(Audio)을 분석, Ableton Live를 실시간 제어하는 AI DJ 시스템입니다.
+본 프로젝트는 일반 대중(비전문 DJ)을 대상으로, 카메라/마이크 기반 입력을 해석해 실시간 디제잉 경험을 제공하는 인터랙티브 AI DJ 시스템입니다.
 
-## 2. Hardware & Execution Environment
+## 2. Hackathon Context & Compliance
+* 본 프로젝트는 **Google AI 제품군 활용**을 핵심 평가 포인트로 삼습니다.
+* 데모에서는 반드시 **해커톤 기간 중 팀이 직접 구현한 기여**를 명확히 보여야 합니다.
+* 해커톤 가이드에 따라 **Streamlit 애플리케이션은 사용하지 않습니다**.
+
+## 3. Execution Environment
 * **Device:** Apple MacBook Pro 14 (Apple Silicon M1 Pro)
-* **Optimization:** M1 Pro의 Neural Engine을 활용한 실시간 비전 처리 최적화 필요.
-* **Input Sources:** - **Video:** MacBook 내장 FaceTime HD 카메라
-    - **Audio:** MacBook 내장 마이크
-* **Runtime:** Python 3.10+ (macOS ARM64 환경)
-* **DAW:** Ableton Live 12 (Trial 포함)
+* **OS/Runtime:** macOS ARM64, Python 3.10+
+* **Input Devices:** MacBook 내장 FaceTime 카메라, MacBook 내장 마이크
+* **DAW:** Ableton Live 12 (Trial/유료 모두 가능)
 
-## 3. Core Communication Protocol: OSC (Open Sound Control)
-* **Standard:** 모든 데이터 전송은 MIDI가 아닌 **OSC**를 원칙으로 합니다.
-* **Ableton Side:** `AbletonOSC` 리모트 스크립트가 11000 포트에서 대기합니다.
-* **Python Side:** `pylive` 라이브러리를 사용하여 Ableton의 객체 모델(LOM)에 직접 접근합니다.
+## 4. AI + Control Stack
+* **Gemini Multimodal Live API (Cloud):** Macro 맥락 추론 + Function Calling
+* **MediaPipe (Local):** Micro 제어(후속 단계에서 재통합)
+* **Ableton Control:** AbletonOSC + `pylive`
 
-## 4. Dual-Layer Control Logic (Hybrid Design)
-시스템은 반응 속도와 지능적 판단을 모두 잡기 위해 두 개의 레이어로 분리되어 작동합니다.
+## 5. Current Delivery Phase (Macro-First)
+* 현재 전달 단계는 **Macro 우선(Gemini 중심)** 입니다.
+* Gemini가 장면/의도 기반 Macro 제어를 생성하고, Python이 smoothing/interpolation 후 Ableton에 반영합니다.
+* MediaPipe 기반 즉각 반응형 Micro 제어는 제거가 아니라 **후속 단계로 이연**합니다.
 
-### Layer 1: Real-time Kinetic Control (Micro)
-* **Source:** MediaPipe (Hand/Pose Landmarks)
-* **Characteristic:** 0.01초 단위의 즉각적인 필터링, 비트 쪼개기 등 '연주적 타격감' 담당.
-* **Logic:** - 내장 웹캠 프레임(30fps)에서 좌표를 추출하여 특정 파라미터에 직결.
-    - 특정 제스처(예: 귀에 손 대기, 주먹 쥐기 등)를 이펙터 활성화 스위치(Trigger)로 활용.
+## 6. Control Contract (Frozen)
+### 6.1 GeminiMacroControls (외부 계약)
+* 모든 입력 값은 `[-1.0, 1.0]` 범위를 사용합니다.
+* `0.0`은 중립(의미 있는 변화 최소)을 의미합니다.
 
-### Layer 2: Contextual Intelligence Control (Macro)
-* **Source:** Gemini Multimodal Live API
-* **Characteristic:** 음성 명령 이해, 전체적인 에너지 레벨 관리 등 '무대 연출' 담당.
-* **Logic:** - 내장 마이크를 통해 사용자 명령을 수신하고 비동기적으로 상황을 추론.
-    - **Smoothing Engine:** AI가 결정한 목표 값(Target State)은 오디오 튐 방지를 위해 파이썬 백엔드에서 부드러운 보간(Interpolation)을 거쳐 OSC로 전송.
+### 6.2 BackendNormalizedControls (내부 계약)
+* Ableton write 직전 값은 `[0.0, 1.0]` 정규화 범위를 사용합니다.
+* 대칭형(symmetric) 타깃 기본식: `n01 = (x + 1.0) / 2.0`
+* 원사이드(one-sided) 타깃(`reverb_macro`, `beat_repeat_macro`):
+  * `x < 0`이면 `0.0`으로 클램프
+  * `x >= 0`이면 `n01 = x`로 매핑
+* Deadzone 규칙: `abs(x) < 0.05`이면 중립으로 처리
+  * symmetric 타깃 중립값: `0.5`
+  * one-sided 타깃 중립값: `0.0`
 
-## 5. Technical Requirements & Constraints
-* **Async Infrastructure:** `asyncio`를 기반으로 Vision(웹캠), Audio(마이크), OSC 루프가 병렬 실행되어야 합니다.
-* **Zero-Setup Policy:** `AbletonOSC`를 통해 동적으로 파라미터를 탐색하므로, 에이블톤 내에서 수동 MIDI 매핑(Cmd+M)은 지양합니다.
+## 7. Ableton Control Principles
+* 제어 프로토콜 표준은 **OSC**입니다.
+* Ableton 측은 `AbletonOSC`를 사용하며 기본 포트는 `11000`입니다.
+* Python 측은 `pylive`로 LOM(Live Object Model)을 제어합니다.
+* 수동 MIDI 매핑(`Cmd+M`) 기반 운영은 기본 경로에서 제외합니다.
+* 콘텐츠 셋업(음원 슬롯 배치, 디바이스 최초 로드)은 수동 준비를 기본으로 합니다.
+* 퍼포먼스 제어(재생, 정지, 파라미터 조작)는 Python 자동화를 기본으로 합니다.
 
-## 6. Development Roadmap (Module-based)
-1. **`ableton_controller.py`**: `pylive` 기반 파라미터 제어 및 값 보간(Smoothing) 로직.
-2. **`vision_engine.py`**: 내장 카메라 기반 MediaPipe 좌표 추출 및 제스처 판별.
-3. **`ai_agent.py`**: Gemini Live API 연결 및 Function Calling 정의.
-4. **`main.py`**: 전체 모듈을 통합하는 비동기 이벤트 루프 엔트리포인트.
+## 8. Super Rack v1 Baseline (Frozen)
+* 기준 트랙: `DJ_MAIN`
+* 기준 이펙터 4종: `Auto Filter`, `Beat Repeat`, `Reverb`, `EQ Three`
+* 고정 논리 타깃 이름:
+  * `filter_macro`
+  * `beat_repeat_macro`
+  * `reverb_macro`
+  * `eq_low_macro`
+* 기본 설정 파일은 `config/ableton_targets.json`을 사용합니다.
+
+## 9. Runtime Interface (Current)
+* `main.py`는 merged controls를 `control_contract.py`를 통해 `[-1, 1] -> [0, 1]` 변환 후 적용합니다.
+* auto-play는 명시적 opt-in입니다.
+  * `--auto-play --auto-play-mode clip --auto-play-track 0 --auto-play-slot 0`
+  * `--auto-play --auto-play-mode song`
+
+## 10. Verification Commands
+```bash
+python scripts/list_live_structure.py --max-params 24
+python scripts/smoke_pylive.py --targets config/ableton_targets.json --all-targets --value 0.8
+python main.py --targets config/ableton_targets.json --auto-play --auto-play-mode clip --auto-play-track 0 --auto-play-slot 0
+```
+
+## 11. Document Boundary
+* 이 문서는 **확정 원칙**만 다룹니다.
+* 미정 아이디어, 실험 항목, 임시 전략은 `docs/working-notes.md`에서 관리합니다.
